@@ -2,13 +2,19 @@
 
 import { useState, useEffect } from 'react';
 
+type OutlineItem = {
+  title: string;
+  page: number;
+  level: number;
+};
+
 type Book = {
   name: string;
   cover: string;
   timestamp: number;
   paragraphs?: string[];
-  outline?: any[];
-  pageMap?: number[]; // paragraph index → page number
+  outline?: OutlineItem[];
+  pageMap?: number[];
 };
 
 type SidebarPos = 'left' | 'right' | 'top' | 'bottom';
@@ -21,7 +27,7 @@ export default function PDFReader() {
   const [library, setLibrary] = useState<Book[]>([]);
   const [sidebarPos, setSidebarPos] = useState<SidebarPos>('left');
   const [showTOC, setShowTOC] = useState(false);
-  const [outline, setOutline] = useState<any[]>([]);
+  const [outline, setOutline] = useState<OutlineItem[]>([]);
   const [pageMap, setPageMap] = useState<number[]>([]);
 
   useEffect(() => {
@@ -39,6 +45,58 @@ export default function PDFReader() {
   const savePos = (pos: SidebarPos) => {
     localStorage.setItem('sidebar-pos', pos);
     setSidebarPos(pos);
+  };
+
+  // Robust outline extraction
+  const extractOutline = async (pdf: any, items: any[], level = 0): Promise<OutlineItem[]> => {
+    const result: OutlineItem[] = [];
+
+    for (const item of items) {
+      let pageNum = 1;
+
+      try {
+        let dest = item.dest;
+
+        // Case 1: Named destination (string)
+        if (typeof dest === 'string') {
+          dest = await pdf.getDestination(dest);
+        }
+
+        // Case 2: dest is an array like [pageRef, ...]
+        if (Array.isArray(dest) && dest.length > 0) {
+          const pageRef = dest[0];
+
+          if (pageRef) {
+            try {
+              const pageIndex = await pdf.getPageIndex(pageRef);
+              if (typeof pageIndex === 'number') {
+                pageNum = pageIndex + 1;
+              }
+            } catch (e) {
+              // Sometimes pageRef is already a page number
+              if (typeof pageRef === 'number') {
+                pageNum = pageRef + 1;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to resolve destination for:', item.title);
+      }
+
+      result.push({
+        title: item.title,
+        page: pageNum,
+        level
+      });
+
+      if (item.items && item.items.length > 0) {
+        const children = await extractOutline(pdf, item.items, level + 1);
+        result.push(...children);
+      }
+    }
+
+    return result;
   };
 
   const handleFile = async (file: File) => {
@@ -59,7 +117,7 @@ export default function PDFReader() {
     const coverData = canvas.toDataURL();
     setCover(coverData);
 
-    // Extract text + build page map
+    // Text + pageMap
     let allText: string[] = [];
     let newPageMap: number[] = [];
 
@@ -72,7 +130,6 @@ export default function PDFReader() {
       const startIdx = allText.length;
       allText.push(...paras);
 
-      // Map every new paragraph to this page number
       for (let j = 0; j < paras.length; j++) {
         newPageMap[startIdx + j] = i;
       }
@@ -82,8 +139,12 @@ export default function PDFReader() {
     setPageMap(newPageMap);
 
     // Outline
-    const pdfOutline = await pdf.getOutline();
-    setOutline(pdfOutline || []);
+    const rawOutline = await pdf.getOutline();
+    let cleanOutline: OutlineItem[] = [];
+    if (rawOutline) {
+      cleanOutline = await extractOutline(pdf, rawOutline);
+    }
+    setOutline(cleanOutline);
 
     setMode('cover');
 
@@ -92,7 +153,7 @@ export default function PDFReader() {
       cover: coverData,
       timestamp: Date.now(),
       paragraphs: allText,
-      outline: pdfOutline || [],
+      outline: cleanOutline,
       pageMap: newPageMap
     };
     const updated = [newBook, ...library.filter(b => b.name !== file.name)].slice(0, 20);
@@ -111,38 +172,22 @@ export default function PDFReader() {
   const isHorizontal = sidebarPos === 'top' || sidebarPos === 'bottom';
   const isBottom = sidebarPos === 'bottom';
 
-  // Navigate to a specific page from outline
-  const navigateToOutline = async (dest: any) => {
-    if (!dest) return;
-
+  const navigateToChapter = (targetPage: number) => {
     setMode('reader');
     setShowTOC(false);
 
-    try {
-      const pdfjs = await import('pdfjs-dist/legacy/build/pdf');
-      const pdf = await pdfjs.getDocument({ data: await fetch(fileName).then(r => r.arrayBuffer()) }).promise; // won't work for stored
-
-      // This is complex. For now we use a better heuristic:
-      // Find first paragraph that belongs to the destination page
-    } catch (e) {}
-
-    // Fallback: better scroll using pageMap if available
-    if (pageMap.length > 0 && typeof dest === 'object' && dest[0]) {
-      // dest[0] is usually the page reference
-      const pageNum = dest[0].num || 1;
-      const targetParaIndex = pageMap.findIndex(p => p >= pageNum);
-
-      if (targetParaIndex !== -1) {
-        const element = document.querySelector(`.reader-content p:nth-child(${targetParaIndex + 1})`);
-        if (element) {
-          element.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          return;
-        }
+    setTimeout(() => {
+      if (pageMap.length === 0) {
+        window.scrollTo({ top: targetPage * 100, behavior: 'smooth' });
+        return;
       }
-    }
 
-    // Last resort: scroll based on rough estimate
-    window.scrollTo({ top: 600, behavior: 'smooth' });
+      let targetIndex = pageMap.findIndex(p => p >= targetPage);
+      if (targetIndex === -1) targetIndex = 0;
+
+      const scrollPosition = Math.max(150, targetIndex * 75);
+      window.scrollTo({ top: scrollPosition, behavior: 'smooth' });
+    }, 120);
   };
 
   const Nav = () => {
@@ -172,17 +217,15 @@ export default function PDFReader() {
     );
   };
 
-  const renderOutline = (items: any[], level = 0): React.ReactNode => {
+  const renderOutline = (items: OutlineItem[]) => {
     return items.map((item, idx) => (
-      <div key={idx}>
-        <div 
-          style={{ paddingLeft: level * 14 }} 
-          className="py-1.5 text-sm text-zinc-300 hover:text-white cursor-pointer"
-          onClick={() => navigateToOutline(item.dest)}
-        >
-          {item.title}
-        </div>
-        {item.items && item.items.length > 0 && renderOutline(item.items, level + 1)}
+      <div 
+        key={idx}
+        style={{ paddingLeft: item.level * 14 }}
+        className="py-1.5 text-sm text-zinc-300 hover:text-white cursor-pointer"
+        onClick={() => navigateToChapter(item.page)}
+      >
+        {item.title}
       </div>
     ));
   };
@@ -234,7 +277,7 @@ export default function PDFReader() {
           </div>
         )}
 
-        {/* Library & Settings remain the same */}
+        {/* Library */}
         {mode === 'library' && (
           <div className="max-w-5xl mx-auto p-8">
             <div className="text-2xl mb-8">Library</div>
@@ -253,6 +296,7 @@ export default function PDFReader() {
           </div>
         )}
 
+        {/* Settings */}
         {mode === 'settings' && (
           <div className="max-w-md mx-auto p-8">
             <div className="text-2xl mb-8">Settings</div>
